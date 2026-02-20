@@ -10,14 +10,52 @@ Usage:
 """
 
 import cv2
-import mediapipe as mp
 import numpy as np
 import argparse
 import subprocess
 import os
 import sys
+import io
+import urllib.request
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
+
+# Fix Windows console encoding for emoji support
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+# MediaPipe Tasks API (new API for MediaPipe 0.10.30+)
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+MODEL_PATH = "hand_landmarker.task"
+
+# MediaPipe landmark names
+LANDMARK_NAMES = [
+    "WRIST", "THUMB_CMC", "THUMB_MCP", "THUMB_IP", "THUMB_TIP",
+    "INDEX_MCP", "INDEX_PIP", "INDEX_DIP", "INDEX_TIP",
+    "MIDDLE_MCP", "MIDDLE_PIP", "MIDDLE_DIP", "MIDDLE_TIP",
+    "RING_MCP", "RING_PIP", "RING_DIP", "RING_TIP",
+    "PINKY_MCP", "PINKY_PIP", "PINKY_DIP", "PINKY_TIP"
+]
+
+# Hand connections for drawing
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),      # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),      # Index
+    (0, 9), (9, 10), (10, 11), (11, 12), # Middle
+    (0, 13), (13, 14), (14, 15), (15, 16), # Ring
+    (0, 17), (17, 18), (18, 19), (19, 20), # Pinky
+    (5, 9), (9, 13), (13, 17)            # Palm
+]
 
 
 # ============================================================================
@@ -30,6 +68,25 @@ class HandLandmarks:
     raw_coords: np.ndarray          # Shape: (21, 3) - original (x, y, z)
     normalized_coords: np.ndarray   # Shape: (21, 3) - wrist-relative normalized
     handedness: str                 # "Left" or "Right"
+
+
+# ============================================================================
+# MODEL DOWNLOAD
+# ============================================================================
+
+def download_model():
+    """Download the MediaPipe hand landmarker model if not present."""
+    if os.path.exists(MODEL_PATH):
+        print(f"✅ Model already exists: {MODEL_PATH}")
+        return
+    
+    print(f"⬇️  Downloading hand landmarker model...")
+    try:
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print(f"✅ Model downloaded: {MODEL_PATH}")
+    except Exception as e:
+        print(f"❌ Failed to download model: {e}")
+        sys.exit(1)
 
 
 # ============================================================================
@@ -142,7 +199,7 @@ def extract_landmarks(
     Extract raw and normalized coordinates from MediaPipe hand landmarks.
     
     Args:
-        hand_landmarks: MediaPipe hand landmarks object
+        hand_landmarks: MediaPipe hand landmarks (list of NormalizedLandmark)
         handedness: "Left" or "Right"
         image_width: Frame width in pixels
         image_height: Frame height in pixels
@@ -152,7 +209,7 @@ def extract_landmarks(
     """
     # Extract raw (x, y, z) for all 21 landmarks
     raw_coords = np.array([
-        [lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark
+        [lm.x, lm.y, lm.z] for lm in hand_landmarks
     ])
     
     # Normalize coordinates
@@ -238,32 +295,59 @@ def normalize_landmarks(coords: np.ndarray) -> np.ndarray:
 def draw_landmarks_on_frame(
     frame: np.ndarray,
     hand_landmarks,
-    mp_hands,
-    mp_drawing,
-    mp_drawing_styles
+    image_width: int,
+    image_height: int
 ) -> np.ndarray:
     """
     Draw hand landmarks and connections on the frame.
     
     Args:
         frame: BGR image from OpenCV
-        hand_landmarks: MediaPipe hand landmarks
-        mp_hands: MediaPipe hands module
-        mp_drawing: MediaPipe drawing utilities
-        mp_drawing_styles: MediaPipe drawing styles
+        hand_landmarks: List of NormalizedLandmark from MediaPipe
+        image_width: Frame width in pixels
+        image_height: Frame height in pixels
     
     Returns:
         Frame with landmarks drawn
     """
     annotated = frame.copy()
     
-    mp_drawing.draw_landmarks(
-        annotated,
-        hand_landmarks,
-        mp_hands.HAND_CONNECTIONS,
-        mp_drawing_styles.get_default_hand_landmarks_style(),
-        mp_drawing_styles.get_default_hand_connections_style()
-    )
+    # Convert normalized coordinates to pixel coordinates
+    points = []
+    for lm in hand_landmarks:
+        x = int(lm.x * image_width)
+        y = int(lm.y * image_height)
+        points.append((x, y))
+    
+    # Draw connections
+    for connection in HAND_CONNECTIONS:
+        start_idx, end_idx = connection
+        cv2.line(
+            annotated,
+            points[start_idx],
+            points[end_idx],
+            (0, 255, 0),  # Green
+            2
+        )
+    
+    # Draw landmarks
+    for i, (x, y) in enumerate(points):
+        # Different colors for different finger groups
+        if i == 0:
+            color = (255, 0, 0)     # Blue for wrist
+        elif i <= 4:
+            color = (255, 128, 0)   # Orange for thumb
+        elif i <= 8:
+            color = (255, 255, 0)   # Cyan for index
+        elif i <= 12:
+            color = (0, 255, 0)     # Green for middle
+        elif i <= 16:
+            color = (0, 255, 255)   # Yellow for ring
+        else:
+            color = (0, 128, 255)   # Orange for pinky
+        
+        cv2.circle(annotated, (x, y), 5, color, -1)
+        cv2.circle(annotated, (x, y), 7, (255, 255, 255), 1)
     
     return annotated
 
@@ -280,21 +364,12 @@ def print_landmark_data(landmarks: HandLandmarks, frame_num: int):
     print(f"🖐️  HAND DETECTED - Frame #{frame_num} ({landmarks.handedness} Hand)")
     print("=" * 70)
     
-    # MediaPipe landmark names
-    landmark_names = [
-        "WRIST", "THUMB_CMC", "THUMB_MCP", "THUMB_IP", "THUMB_TIP",
-        "INDEX_MCP", "INDEX_PIP", "INDEX_DIP", "INDEX_TIP",
-        "MIDDLE_MCP", "MIDDLE_PIP", "MIDDLE_DIP", "MIDDLE_TIP",
-        "RING_MCP", "RING_PIP", "RING_DIP", "RING_TIP",
-        "PINKY_MCP", "PINKY_PIP", "PINKY_DIP", "PINKY_TIP"
-    ]
-    
     print("\n📍 RAW COORDINATES (MediaPipe normalized 0-1):")
     print("-" * 70)
     print(f"{'#':<3} {'Landmark':<14} {'X':>10} {'Y':>10} {'Z':>10}")
     print("-" * 70)
     
-    for i, (name, coord) in enumerate(zip(landmark_names, landmarks.raw_coords)):
+    for i, (name, coord) in enumerate(zip(LANDMARK_NAMES, landmarks.raw_coords)):
         print(f"{i:<3} {name:<14} {coord[0]:>10.6f} {coord[1]:>10.6f} {coord[2]:>10.6f}")
     
     print("\n📐 NORMALIZED COORDINATES (Wrist-relative, scale-invariant):")
@@ -302,7 +377,7 @@ def print_landmark_data(landmarks: HandLandmarks, frame_num: int):
     print(f"{'#':<3} {'Landmark':<14} {'X':>10} {'Y':>10} {'Z':>10}")
     print("-" * 70)
     
-    for i, (name, coord) in enumerate(zip(landmark_names, landmarks.normalized_coords)):
+    for i, (name, coord) in enumerate(zip(LANDMARK_NAMES, landmarks.normalized_coords)):
         print(f"{i:<3} {name:<14} {coord[0]:>10.6f} {coord[1]:>10.6f} {coord[2]:>10.6f}")
     
     print("\n" + "=" * 70)
@@ -323,20 +398,29 @@ def process_video(cap: cv2.VideoCapture, print_first_detection: bool = True):
         cap: OpenCV VideoCapture object
         print_first_detection: If True, print landmarks for first detection only
     """
-    # Initialize MediaPipe
-    mp_hands = mp.solutions.hands
-    mp_drawing = mp.solutions.drawing_utils
-    mp_drawing_styles = mp.solutions.drawing_styles
+    # Download model if needed
+    download_model()
     
-    hands = mp_hands.Hands(
-        static_image_mode=False,      # Video mode (tracking between frames)
-        max_num_hands=2,              # Detect up to 2 hands
-        min_detection_confidence=0.7,
+    # Create hand landmarker with new Tasks API
+    base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
         min_tracking_confidence=0.5
     )
     
+    landmarker = vision.HandLandmarker.create_from_options(options)
+    
     frame_num = 0
     first_detection_done = False
+    
+    # Get video FPS for timestamp calculation
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30  # Default fallback
     
     print("\n🎬 Starting video processing...")
     print("   Window will open. Press 'Q' to quit.\n")
@@ -355,27 +439,30 @@ def process_video(cap: cv2.VideoCapture, print_first_detection: bool = True):
             # Convert BGR to RGB (MediaPipe expects RGB)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
+            # Create MediaPipe Image
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            
+            # Calculate timestamp in milliseconds
+            timestamp_ms = int((frame_num / fps) * 1000)
+            
             # Process frame with MediaPipe
-            results = hands.process(rgb_frame)
+            results = landmarker.detect_for_video(mp_image, timestamp_ms)
             
             # Create display frame
             display_frame = frame.copy()
             
-            if results.multi_hand_landmarks:
-                for hand_landmarks, handedness_info in zip(
-                    results.multi_hand_landmarks,
-                    results.multi_handedness
-                ):
-                    # Get handedness label
-                    handedness = handedness_info.classification[0].label
+            if results.hand_landmarks:
+                for hand_idx, hand_landmarks in enumerate(results.hand_landmarks):
+                    # Get handedness
+                    handedness = "Unknown"
+                    if results.handedness and hand_idx < len(results.handedness):
+                        handedness = results.handedness[hand_idx][0].category_name
                     
                     # Draw landmarks on display frame
                     display_frame = draw_landmarks_on_frame(
                         display_frame,
                         hand_landmarks,
-                        mp_hands,
-                        mp_drawing,
-                        mp_drawing_styles
+                        w, h
                     )
                     
                     # Extract and print landmarks (first detection only if flag set)
@@ -397,8 +484,8 @@ def process_video(cap: cv2.VideoCapture, print_first_detection: bool = True):
                 2
             )
             
-            status = "Hand Detected!" if results.multi_hand_landmarks else "No Hand"
-            color = (0, 255, 0) if results.multi_hand_landmarks else (0, 0, 255)
+            status = "Hand Detected!" if results.hand_landmarks else "No Hand"
+            color = (0, 255, 0) if results.hand_landmarks else (0, 0, 255)
             cv2.putText(
                 display_frame,
                 status,
@@ -418,7 +505,7 @@ def process_video(cap: cv2.VideoCapture, print_first_detection: bool = True):
                 break
     
     finally:
-        hands.close()
+        landmarker.close()
         cap.release()
         cv2.destroyAllWindows()
         print("🏁 Processing complete.")
