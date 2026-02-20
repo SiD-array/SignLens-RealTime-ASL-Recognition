@@ -49,6 +49,7 @@ youtube_video.*
 *.pkl
 *.joblib
 *.onnx
+*.task
 saved_models/
 
 # Data files
