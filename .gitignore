@@ -52,11 +52,12 @@ youtube_video.*
 *.task
 saved_models/
 
-# Data files
+# Data files (large datasets - not tracked)
 data/
 datasets/
 *.csv
 *.json
+*.zip
 
 # Logs
 *.log
