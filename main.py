@@ -437,9 +437,15 @@ def main():
                 hand_landmarks = results.hand_landmarks[0]
                 
                 # Get handedness (Left or Right)
-                # In selfie view, MediaPipe reports the actual hand of the user
+                # IMPORTANT: In selfie/mirror view, the frame is flipped BEFORE detection,
+                # so MediaPipe reports the OPPOSITE handedness:
+                #   - User shows RIGHT hand → appears on LEFT of flipped frame → MediaPipe says "Left"
+                #   - User shows LEFT hand → appears on RIGHT of flipped frame → MediaPipe says "Right"
+                # We must INVERT the reported handedness to get the user's actual hand.
                 if results.handedness and len(results.handedness) > 0:
-                    detected_handedness = results.handedness[0][0].category_name
+                    mp_handedness = results.handedness[0][0].category_name
+                    # Invert for selfie view
+                    detected_handedness = "Left" if mp_handedness == "Right" else "Right"
                 else:
                     detected_handedness = "Right"  # Default assumption
                 
