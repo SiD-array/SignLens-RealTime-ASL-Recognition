@@ -54,6 +54,11 @@ CONFIDENCE_THRESHOLD = 0.70  # Minimum confidence to display gesture
 OVERLAY_HEIGHT = 80       # Height of bottom overlay
 OVERLAY_ALPHA = 0.7       # Transparency of overlay (0-1)
 
+# Handedness settings
+# Set this to the hand the model was primarily trained on
+# The script will mirror coordinates for the opposite hand
+MODEL_TRAINED_HAND = "Right"  # "Right" or "Left"
+
 
 # ============================================================================
 # MODEL LOADING
@@ -122,9 +127,18 @@ def normalize_landmarks(coords: np.ndarray) -> np.ndarray:
     return translated / scale
 
 
-def extract_landmarks(hand_landmarks) -> Optional[np.ndarray]:
+def extract_landmarks(hand_landmarks, handedness: str, is_selfie_view: bool = True) -> Optional[np.ndarray]:
     """
     Extract and normalize landmarks from MediaPipe detection.
+    
+    Includes handedness invariance: if the detected hand is opposite to what
+    the model was trained on, we mirror the x-coordinates to make the 
+    landmark geometry consistent.
+    
+    Args:
+        hand_landmarks: MediaPipe hand landmarks
+        handedness: "Left" or "Right" as reported by MediaPipe
+        is_selfie_view: True if frame was horizontally flipped (mirror mode)
     
     Returns:
         Flattened array of 63 values or None if extraction fails
@@ -135,8 +149,36 @@ def extract_landmarks(hand_landmarks) -> Optional[np.ndarray]:
     # Extract raw coordinates
     raw_coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks])
     
-    # Normalize
+    # Normalize (wrist-relative + scale)
     normalized = normalize_landmarks(raw_coords)
+    
+    # =========================================================================
+    # HANDEDNESS INVARIANCE
+    # =========================================================================
+    # 
+    # In selfie/mirror view (cv2.flip), MediaPipe reports:
+    #   - "Left" when the user shows their LEFT hand (appears on RIGHT of screen)
+    #   - "Right" when the user shows their RIGHT hand (appears on LEFT of screen)
+    #
+    # If the model was trained on right-hand data, left-hand landmarks have
+    # mirrored geometry. To fix this, we flip the x-coordinates:
+    #
+    #   x_mirrored = -x_normalized
+    #
+    # This transforms left-hand geometry to match right-hand geometry.
+    # =========================================================================
+    
+    # Determine if we need to mirror based on handedness
+    # In selfie view, MediaPipe's reported handedness matches the user's actual hand
+    detected_hand = handedness
+    
+    # Mirror if detected hand differs from model's training hand
+    needs_mirror = (detected_hand != MODEL_TRAINED_HAND)
+    
+    if needs_mirror:
+        # Mirror x-coordinates (multiply by -1)
+        # normalized shape is (21, 3) where columns are [x, y, z]
+        normalized[:, 0] = -normalized[:, 0]
     
     # Flatten to 1D array (63 values)
     return normalized.flatten()
@@ -250,7 +292,13 @@ def draw_hand_landmarks(frame: np.ndarray, hand_landmarks, width: int, height: i
         cv2.circle(frame, (x, y), 5, color, -1)
 
 
-def draw_overlay(frame: np.ndarray, gesture: Optional[str], confidence: float, hand_detected: bool):
+def draw_overlay(
+    frame: np.ndarray, 
+    gesture: Optional[str], 
+    confidence: float, 
+    hand_detected: bool,
+    handedness: Optional[str] = None
+):
     """
     Draw a semi-transparent overlay at the bottom with gesture info.
     
@@ -259,8 +307,10 @@ def draw_overlay(frame: np.ndarray, gesture: Optional[str], confidence: float, h
         gesture: The recognized gesture name (or None)
         confidence: The prediction confidence (0-1)
         hand_detected: Whether a hand was detected in the current frame
+        handedness: "Left" or "Right" if hand detected, None otherwise
     """
     h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
     
     # Create overlay region
     overlay = frame.copy()
@@ -286,7 +336,6 @@ def draw_overlay(frame: np.ndarray, gesture: Optional[str], confidence: float, h
         text_color = (150, 150, 150)  # Gray
     
     # Draw gesture text (large, bold)
-    font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 1.5
     thickness = 3
     
@@ -313,6 +362,24 @@ def draw_overlay(frame: np.ndarray, gesture: Optional[str], confidence: float, h
     # Draw "LIVE" indicator
     cv2.putText(frame, "LIVE", (10, 30), font, 0.6, (0, 0, 255), 2)
     cv2.circle(frame, (65, 25), 5, (0, 0, 255), -1)
+    
+    # =========================================================================
+    # DEBUG: Draw handedness info in top-right corner
+    # =========================================================================
+    if handedness:
+        hand_text = f"Hand: {handedness}"
+        # Color code: Green if matches model, Yellow if mirrored
+        is_mirrored = (handedness != MODEL_TRAINED_HAND)
+        hand_color = (0, 255, 255) if is_mirrored else (0, 255, 0)  # Yellow if mirrored, Green if native
+        
+        cv2.putText(frame, hand_text, (w - 130, 30), font, 0.6, (0, 0, 0), 3)  # Shadow
+        cv2.putText(frame, hand_text, (w - 130, 30), font, 0.6, hand_color, 2)
+        
+        # Show if mirroring is applied
+        if is_mirrored:
+            cv2.putText(frame, "(mirrored)", (w - 130, 55), font, 0.5, (0, 200, 255), 1)
+    else:
+        cv2.putText(frame, "Hand: None", (w - 130, 30), font, 0.6, (100, 100, 100), 2)
 
 
 # ============================================================================
@@ -351,7 +418,7 @@ def main():
                 print("Error: Failed to read frame")
                 break
             
-            # Flip frame horizontally (mirror effect)
+            # Flip frame horizontally (mirror/selfie effect)
             frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
             
@@ -364,15 +431,27 @@ def main():
             
             hand_detected = bool(results.hand_landmarks)
             current_confidence = 0.0
+            detected_handedness = None
             
             if results.hand_landmarks:
                 hand_landmarks = results.hand_landmarks[0]
                 
+                # Get handedness (Left or Right)
+                # In selfie view, MediaPipe reports the actual hand of the user
+                if results.handedness and len(results.handedness) > 0:
+                    detected_handedness = results.handedness[0][0].category_name
+                else:
+                    detected_handedness = "Right"  # Default assumption
+                
                 # Draw hand landmarks
                 draw_hand_landmarks(frame, hand_landmarks, w, h)
                 
-                # Extract and normalize landmarks
-                features = extract_landmarks(hand_landmarks)
+                # Extract and normalize landmarks (with handedness-aware mirroring)
+                features = extract_landmarks(
+                    hand_landmarks, 
+                    handedness=detected_handedness,
+                    is_selfie_view=True  # Frame is flipped
+                )
                 
                 if features is not None:
                     # Get prediction probabilities
@@ -387,8 +466,8 @@ def main():
             # Get stable prediction from buffer
             stable_gesture, stable_confidence = prediction_buffer.get_stable_prediction()
             
-            # Draw UI overlay
-            draw_overlay(frame, stable_gesture, stable_confidence, hand_detected)
+            # Draw UI overlay (with handedness debug info)
+            draw_overlay(frame, stable_gesture, stable_confidence, hand_detected, detected_handedness)
             
             # Display frame
             cv2.imshow("SignLens - ASL Recognition", frame)
