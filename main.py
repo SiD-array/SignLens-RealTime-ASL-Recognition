@@ -437,25 +437,28 @@ def main():
                 hand_landmarks = results.hand_landmarks[0]
                 
                 # Get handedness (Left or Right)
-                # IMPORTANT: In selfie/mirror view, the frame is flipped BEFORE detection,
-                # so MediaPipe reports the OPPOSITE handedness:
-                #   - User shows RIGHT hand → appears on LEFT of flipped frame → MediaPipe says "Left"
-                #   - User shows LEFT hand → appears on RIGHT of flipped frame → MediaPipe says "Right"
-                # We must INVERT the reported handedness to get the user's actual hand.
+                # MediaPipe reports handedness based on the flipped frame.
+                # We need TWO versions:
+                #   1. mp_handedness: Raw from MediaPipe - used for landmark mirroring (model expects this)
+                #   2. display_handedness: Inverted - shown to user (matches their actual hand)
                 if results.handedness and len(results.handedness) > 0:
                     mp_handedness = results.handedness[0][0].category_name
-                    # Invert for selfie view
-                    detected_handedness = "Left" if mp_handedness == "Right" else "Right"
                 else:
-                    detected_handedness = "Right"  # Default assumption
+                    mp_handedness = "Right"  # Default assumption
+                
+                # Invert for display only (user sees correct hand label)
+                # In selfie view: MediaPipe "Left" = User's Right hand, and vice versa
+                display_handedness = "Left" if mp_handedness == "Right" else "Right"
+                detected_handedness = display_handedness  # For UI display
                 
                 # Draw hand landmarks
                 draw_hand_landmarks(frame, hand_landmarks, w, h)
                 
                 # Extract and normalize landmarks (with handedness-aware mirroring)
+                # Use RAW MediaPipe handedness for processing (model was trained this way)
                 features = extract_landmarks(
                     hand_landmarks, 
-                    handedness=detected_handedness,
+                    handedness=mp_handedness,  # Use raw MediaPipe handedness for model
                     is_selfie_view=True  # Frame is flipped
                 )
                 
