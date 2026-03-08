@@ -12,13 +12,15 @@ Controls:
 
 import cv2
 import numpy as np
-import pickle
 import sys
 import io
+import json
 import urllib.request
 from pathlib import Path
 from collections import deque
 from typing import Optional, Tuple
+
+import tensorflow as tf
 
 # MediaPipe Tasks API
 import mediapipe as mp
@@ -36,7 +38,8 @@ if sys.platform == "win32":
 # ============================================================================
 
 PROJECT_ROOT = Path(__file__).parent
-MODEL_PATH = PROJECT_ROOT / "sign_language_model.pkl"
+MODEL_PATH = PROJECT_ROOT / "lstm_model.keras"
+LABELS_PATH = PROJECT_ROOT / "labels.json"
 MEDIAPIPE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 MEDIAPIPE_MODEL_PATH = PROJECT_ROOT / "hand_landmarker.task"
 
@@ -45,7 +48,11 @@ CAMERA_INDEX = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 
-# Temporal smoothing settings
+# Temporal sequence settings (for LSTM input)
+SEQUENCE_LENGTH = 30      # Number of frames in each sequence
+FEATURE_SIZE = 63         # 21 landmarks × 3 coordinates
+
+# Temporal smoothing settings (over model predictions)
 BUFFER_SIZE = 10          # Number of frames to consider
 MIN_AGREEMENT = 7         # Minimum frames with same prediction
 CONFIDENCE_THRESHOLD = 0.70  # Minimum confidence to display gesture
@@ -74,18 +81,35 @@ def download_mediapipe_model():
     print("Model downloaded.")
 
 
-def load_classifier():
-    """Load the trained gesture classification model."""
-    if not MODEL_PATH.exists():
-        print(f"Error: Model not found at {MODEL_PATH}")
-        print("Run train_model.py first to train the classifier.")
+def load_labels():
+    """Load gesture labels from labels.json."""
+    if not LABELS_PATH.exists():
+        print(f"Error: labels.json not found at {LABELS_PATH}")
+        print("Create labels.json (a JSON list of label strings) before running this script.")
         sys.exit(1)
-    
-    with open(MODEL_PATH, 'rb') as f:
-        model = pickle.load(f)
-    
-    print(f"Loaded classifier with classes: {list(model.classes_)}")
-    return model
+
+    with open(LABELS_PATH, "r", encoding="utf-8") as f:
+        labels = json.load(f)
+
+    if not isinstance(labels, list) or not all(isinstance(x, str) for x in labels):
+        print('Error: labels.json must be a JSON list of label strings, e.g. ["Hello", "No", ...].')
+        sys.exit(1)
+
+    return labels
+
+
+def load_lstm_model():
+    """Load the trained LSTM action recognition model and its label set."""
+    if not MODEL_PATH.exists():
+        print(f"Error: LSTM model not found at {MODEL_PATH}")
+        print("Run train_lstm.py first to train the action recognition model.")
+        sys.exit(1)
+
+    labels = load_labels()
+    model = tf.keras.models.load_model(MODEL_PATH)
+
+    print(f"Loaded LSTM model with classes: {labels}")
+    return model, labels
 
 
 def create_hand_landmarker():
@@ -393,9 +417,10 @@ def main():
     
     # Initialize components
     print("\nInitializing...")
-    classifier = load_classifier()
+    model, labels = load_lstm_model()
     landmarker = create_hand_landmarker()
     prediction_buffer = PredictionBuffer()
+    sequence_buffer = deque(maxlen=SEQUENCE_LENGTH)
     
     # Initialize webcam
     print(f"Opening webcam (index {CAMERA_INDEX})...")
@@ -457,20 +482,35 @@ def main():
                 # Extract and normalize landmarks (with handedness-aware mirroring)
                 # Use RAW MediaPipe handedness for processing (model was trained this way)
                 features = extract_landmarks(
-                    hand_landmarks, 
+                    hand_landmarks,
                     handedness=mp_handedness,  # Use raw MediaPipe handedness for model
-                    is_selfie_view=True  # Frame is flipped
+                    is_selfie_view=True,  # Frame is flipped
                 )
-                
+
                 if features is not None:
-                    # Get prediction probabilities
-                    proba = classifier.predict_proba([features])[0]
-                    predicted_idx = np.argmax(proba)
-                    predicted_gesture = classifier.classes_[predicted_idx]
-                    current_confidence = proba[predicted_idx]
-                    
-                    # Add to buffer for temporal smoothing
-                    prediction_buffer.add_prediction(predicted_gesture, current_confidence)
+                    # Add features to temporal sequence buffer
+                    sequence_buffer.append(features.astype(np.float32))
+
+                    # Only run prediction when we have a full 30-frame sequence
+                    if len(sequence_buffer) == SEQUENCE_LENGTH:
+                        sequence_array = np.array(sequence_buffer, dtype=np.float32).reshape(
+                            1, SEQUENCE_LENGTH, FEATURE_SIZE
+                        )
+                        proba = model.predict(sequence_array, verbose=0)[0]
+                        predicted_idx = int(np.argmax(proba))
+
+                        if 0 <= predicted_idx < len(labels):
+                            predicted_gesture = labels[predicted_idx]
+                        else:
+                            predicted_gesture = str(predicted_idx)
+
+                        current_confidence = float(proba[predicted_idx])
+
+                        # Add to buffer for temporal smoothing over predictions
+                        prediction_buffer.add_prediction(predicted_gesture, current_confidence)
+            else:
+                # No hand detected; reset temporal sequence buffer
+                sequence_buffer.clear()
             
             # Get stable prediction from buffer
             stable_gesture, stable_confidence = prediction_buffer.get_stable_prediction()

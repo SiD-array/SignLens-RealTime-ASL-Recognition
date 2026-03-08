@@ -1,7 +1,8 @@
 """
 ASL Landmark Extraction Script
 ==============================
-Extracts hand landmarks from gesture images/videos and saves to CSV.
+Extracts hand landmarks from gesture videos and saves 30-frame sequences
+as .npy files for LSTM-based action recognition.
 
 Usage:
     python extract_landmarks.py
@@ -9,11 +10,10 @@ Usage:
 
 import cv2
 import numpy as np
-import csv
 import sys
 import io
+import json
 import urllib.request
-import os
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -35,28 +35,36 @@ if sys.platform == "win32":
 PROJECT_ROOT = Path(__file__).parent
 DATA_DIR = PROJECT_ROOT / "data"
 EXTRACTED_DYNAMIC_DIR = DATA_DIR / "extracted_dynamic"
-PROCESSED_DIR = DATA_DIR / "processed_landmarks"
-OUTPUT_CSV = PROCESSED_DIR / "gesture_landmarks.csv"
+SEQUENCE_DIR = DATA_DIR / "sequences_lstm"
 
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 MODEL_PATH = PROJECT_ROOT / "hand_landmarker.task"
 
-# Target gestures
-GESTURES = ['Hello', 'THANKYOU', 'Sorry', 'Yes', 'No']
-
-# Landmark names for CSV header
-LANDMARK_NAMES = [
-    "WRIST", "THUMB_CMC", "THUMB_MCP", "THUMB_IP", "THUMB_TIP",
-    "INDEX_MCP", "INDEX_PIP", "INDEX_DIP", "INDEX_TIP",
-    "MIDDLE_MCP", "MIDDLE_PIP", "MIDDLE_DIP", "MIDDLE_TIP",
-    "RING_MCP", "RING_PIP", "RING_DIP", "RING_TIP",
-    "PINKY_MCP", "PINKY_PIP", "PINKY_DIP", "PINKY_TIP"
-]
+LABELS_PATH = PROJECT_ROOT / "labels.json"
+SEQUENCE_LENGTH = 30  # Number of frames per gesture clip (matches LSTM input)
 
 
 # ============================================================================
 # MODEL SETUP
 # ============================================================================
+
+def load_labels() -> List[str]:
+    """Load gesture labels from labels.json."""
+    if not LABELS_PATH.exists():
+        print(f"\n❌ Error: labels.json not found at {LABELS_PATH}")
+        print("   Create labels.json as a JSON list of label strings, e.g.:")
+        print('   ["Hello", "THANKYOU", "Sorry", "Yes", "No"]')
+        sys.exit(1)
+
+    with open(LABELS_PATH, "r", encoding="utf-8") as f:
+        labels = json.load(f)
+
+    if not isinstance(labels, list) or not all(isinstance(x, str) for x in labels):
+        print("\n❌ Error: labels.json must be a JSON list of label strings.")
+        sys.exit(1)
+
+    return labels
+
 
 def download_model():
     """Download the MediaPipe hand landmarker model if not present."""
@@ -154,7 +162,7 @@ def extract_landmarks_from_image(
 def extract_landmarks_from_video(
     landmarker: vision.HandLandmarker,
     video_path: Path,
-    sample_rate: int = 5
+    sample_rate: int = 2
 ) -> List[np.ndarray]:
     """
     Extract normalized landmarks from video frames.
@@ -165,7 +173,7 @@ def extract_landmarks_from_video(
         sample_rate: Extract every Nth frame
     
     Returns:
-        List of flattened landmark arrays
+        List of flattened landmark arrays (one per sampled frame)
     """
     cap = cv2.VideoCapture(str(video_path))
     landmarks_list = []
@@ -199,141 +207,153 @@ def extract_landmarks_from_video(
     return landmarks_list
 
 
-# ============================================================================
-# CSV GENERATION
-# ============================================================================
-
-def generate_csv_header() -> List[str]:
-    """Generate CSV header with landmark coordinate names."""
-    header = []
-    for name in LANDMARK_NAMES:
-        header.extend([f"{name}_x", f"{name}_y", f"{name}_z"])
-    header.append("label")
-    return header
+    # ============================================================================
+    # SEQUENCE GENERATION
+    # ============================================================================
 
 
-def process_all_gestures():
-    """Process all gesture folders and save landmarks to CSV."""
+def chunk_into_sequences(frames: List[np.ndarray], sequence_length: int) -> List[np.ndarray]:
+    """
+    Split a list of frame-level landmark vectors into fixed-length sequences.
+
+    Uses an overlapping sliding window so that fast, dynamic gestures
+    (like 'No') are captured multiple times across the motion.
+    """
+    sequences: List[np.ndarray] = []
+    num_frames = len(frames)
+
+    if num_frames < sequence_length:
+        return sequences
+
+    # Step size smaller than sequence length → overlapping clips
+    step = max(1, sequence_length // 5)  # e.g. 30 // 5 = 6
+
+    for start in range(0, num_frames - sequence_length + 1, step):
+        window = frames[start : start + sequence_length]
+        if len(window) == sequence_length:
+            seq = np.stack(window, axis=0).astype(np.float32)  # (sequence_length, 63)
+            sequences.append(seq)
+
+    return sequences
+
+
+def process_all_gestures() -> Path:
+    """Process all gesture folders and save 30-frame sequences as .npy clips."""
     print("\n" + "=" * 60)
-    print("   🤟 ASL LANDMARK EXTRACTION")
+    print("   🤟 ASL LANDMARK EXTRACTION (SEQUENCES)")
     print("=" * 60)
-    
+
+    labels = load_labels()
+
     # Ensure output directory exists
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    
+    SEQUENCE_DIR.mkdir(parents=True, exist_ok=True)
+
     # Create landmarker
     print("\n📦 Loading MediaPipe model...")
     landmarker = create_landmarker()
     print("✅ Model loaded\n")
-    
-    # Prepare CSV
-    header = generate_csv_header()
-    all_rows = []
-    
+
     print("=" * 60)
-    print("📊 PROCESSING GESTURES")
+    print("📊 PROCESSING GESTURES INTO 30-FRAME CLIPS")
     print("=" * 60)
-    
-    for gesture in GESTURES:
+
+    total_sequences = 0
+
+    for gesture in labels:
         gesture_dir = EXTRACTED_DYNAMIC_DIR / gesture
-        
+
         if not gesture_dir.exists():
             print(f"\n⚠️  Gesture folder not found: {gesture}")
             continue
-        
+
+        output_dir = SEQUENCE_DIR / gesture
+        output_dir.mkdir(parents=True, exist_ok=True)
+
         print(f"\n🖐️  Processing '{gesture}'...")
-        gesture_samples = 0
-        
-        # Process video files (.avi)
+        gesture_sequences = 0
+
+        # ---------------------------------------------------------------------
+        # From raw video files (.avi)
+        # ---------------------------------------------------------------------
         video_files = list(gesture_dir.glob("*.avi"))
         for video_path in video_files:
-            landmarks_list = extract_landmarks_from_video(landmarker, video_path)
-            for landmarks in landmarks_list:
-                row = list(landmarks) + [gesture]
-                all_rows.append(row)
-                gesture_samples += 1
-        
-        # Process frame folders (images)
+            frame_landmarks = extract_landmarks_from_video(landmarker, video_path)
+            sequences = chunk_into_sequences(frame_landmarks, SEQUENCE_LENGTH)
+
+            for seq_idx, seq in enumerate(sequences):
+                out_path = output_dir / f"{video_path.stem}_seq{seq_idx:03d}.npy"
+                np.save(out_path, seq)
+                gesture_sequences += 1
+                total_sequences += 1
+
+        # ---------------------------------------------------------------------
+        # From pre-extracted frame folders (images)
+        # ---------------------------------------------------------------------
         frame_folders = [f for f in gesture_dir.iterdir() if f.is_dir() and "_frames" in f.name]
         for folder in frame_folders:
-            image_files = list(folder.glob("*.jpg")) + list(folder.glob("*.png"))
-            
-            # Sample every 5th image to avoid redundancy
-            for i, img_path in enumerate(sorted(image_files)):
-                if i % 5 != 0:
-                    continue
-                
+            image_files = sorted(list(folder.glob("*.jpg")) + list(folder.glob("*.png")))
+            frame_landmarks: List[np.ndarray] = []
+
+            for img_path in image_files:
                 landmarks = extract_landmarks_from_image(landmarker, img_path)
                 if landmarks is not None:
-                    row = list(landmarks) + [gesture]
-                    all_rows.append(row)
-                    gesture_samples += 1
-        
-        print(f"   ✅ Extracted {gesture_samples} samples")
-    
-    # Write CSV
-    print(f"\n💾 Writing CSV to: {OUTPUT_CSV.name}")
-    with open(OUTPUT_CSV, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        writer.writerows(all_rows)
-    
-    print(f"✅ Saved {len(all_rows)} total samples")
-    
+                    frame_landmarks.append(landmarks)
+
+            sequences = chunk_into_sequences(frame_landmarks, SEQUENCE_LENGTH)
+            for seq_idx, seq in enumerate(sequences):
+                out_path = output_dir / f"{folder.name}_seq{seq_idx:03d}.npy"
+                np.save(out_path, seq)
+                gesture_sequences += 1
+                total_sequences += 1
+
+        print(f"   ✅ Saved {gesture_sequences} sequences for '{gesture}'")
+
     # Close landmarker
     landmarker.close()
-    
-    return OUTPUT_CSV
+
+    print(f"\n✅ Saved {total_sequences} total sequences to {SEQUENCE_DIR}")
+    return SEQUENCE_DIR
 
 
-def verify_csv(csv_path: Path):
-    """Print a summary of the CSV for verification."""
+def summarize_sequences(base_dir: Path):
+    """Print a summary of generated .npy sequences."""
     print("\n" + "=" * 60)
-    print("🔍 DATA VERIFICATION")
+    print("🔍 SEQUENCE DATA SUMMARY")
     print("=" * 60)
-    
-    with open(csv_path, 'r') as f:
-        reader = csv.reader(f)
-        header = next(reader)
-        rows = list(reader)
-    
-    print(f"\n📄 File: {csv_path.name}")
-    print(f"📊 Total columns: {len(header)} (63 landmark coords + 1 label)")
-    print(f"📊 Total rows: {len(rows)}")
-    
-    # Count samples per label
+
+    if not base_dir.exists():
+        print(f"\n❌ No sequences found at {base_dir}")
+        return
+
     label_counts = {}
-    for row in rows:
-        label = row[-1]
-        label_counts[label] = label_counts.get(label, 0) + 1
-    
-    print("\n📈 Samples per gesture:")
+    example_shape = None
+
+    for gesture_dir in base_dir.iterdir():
+        if not gesture_dir.is_dir():
+            continue
+
+        npy_files = list(gesture_dir.glob("*.npy"))
+        if not npy_files:
+            continue
+
+        label = gesture_dir.name
+        label_counts[label] = len(npy_files)
+
+        # Peek at first file to confirm shape
+        if example_shape is None:
+            sample = np.load(npy_files[0])
+            example_shape = sample.shape
+
+    if not label_counts:
+        print("\n⚠️  No .npy sequence files found.")
+        return
+
+    print("\n📈 Sequences per gesture:")
     for label, count in sorted(label_counts.items()):
         print(f"   {label}: {count}")
-    
-    # Show sample rows
-    print("\n📋 Sample rows (first 3):")
-    print("-" * 60)
-    
-    for i, row in enumerate(rows[:3]):
-        # Show first few coordinates + label
-        coords_preview = [f"{float(x):.4f}" for x in row[:6]]
-        print(f"Row {i+1}: [{', '.join(coords_preview)}, ...] → '{row[-1]}'")
-    
-    print("-" * 60)
-    
-    # Verify data types
-    print("\n✅ Verification:")
-    try:
-        # Check if coordinates are numeric
-        for row in rows[:10]:
-            for val in row[:-1]:
-                float(val)
-        print("   ✓ All coordinate values are numeric")
-        print("   ✓ Labels are text strings")
-        print("   ✓ CSV format is valid for ML training")
-    except ValueError as e:
-        print(f"   ❌ Error: Non-numeric value found - {e}")
+
+    if example_shape is not None:
+        print(f"\n🧱 Example sequence shape: {example_shape} (frames, features)")
 
 
 # ============================================================================
@@ -341,28 +361,25 @@ def verify_csv(csv_path: Path):
 # ============================================================================
 
 def main():
-    # Check if CSV already exists
-    if OUTPUT_CSV.exists():
-        print(f"\n📄 CSV already exists: {OUTPUT_CSV}")
-        response = input("   Regenerate? (y/n): ").strip().lower()
-        if response != 'y':
-            verify_csv(OUTPUT_CSV)
+    # Check if sequences already exist
+    existing = SEQUENCE_DIR.exists() and any(SEQUENCE_DIR.rglob("*.npy"))
+    if existing:
+        print(f"\n📄 Sequence data already exists under: {SEQUENCE_DIR}")
+        response = input("   Regenerate sequences from raw videos/frames? (y/n): ").strip().lower()
+        if response != "y":
+            summarize_sequences(SEQUENCE_DIR)
             return
-    
-    # Process gestures and generate CSV
-    csv_path = process_all_gestures()
-    
-    # Verify the output
-    verify_csv(csv_path)
-    
+
+    # Process gestures and generate sequences
+    seq_dir = process_all_gestures()
+
+    # Summarize the output
+    summarize_sequences(seq_dir)
+
     print("\n" + "=" * 60)
     print("🎉 EXTRACTION COMPLETE!")
     print("=" * 60)
-    print(f"\nCSV ready for ML training: {OUTPUT_CSV}")
-    print("\nNext steps:")
-    print("  1. Load CSV with pandas: df = pd.read_csv('data/processed_landmarks/gesture_landmarks.csv')")
-    print("  2. Split into X (features) and y (labels)")
-    print("  3. Train classifier (SVM, Random Forest, Neural Net, etc.)")
+    print(f"\n30-frame .npy sequences ready for LSTM training in: {seq_dir}")
     print()
 
 
