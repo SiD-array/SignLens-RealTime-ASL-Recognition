@@ -41,7 +41,12 @@ MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/han
 MODEL_PATH = PROJECT_ROOT / "hand_landmarker.task"
 
 LABELS_PATH = PROJECT_ROOT / "labels.json"
-SEQUENCE_LENGTH = 30  # Number of frames per gesture clip (matches LSTM input)
+SEQUENCE_LENGTH = 30  # Frames per clip (matches main.py LSTM)
+# Multi-hand: 126 features (21×3×2) for WLASL two-hand signs; must match main.py MULTI_HAND
+MULTI_HAND = True
+FEATURE_SIZE_ONE_HAND = 63
+FEATURE_SIZE = 126 if MULTI_HAND else FEATURE_SIZE_ONE_HAND
+MODEL_TRAINED_HAND = "Right"  # Mirror other hand to match (same as main.py)
 
 
 # ============================================================================
@@ -103,20 +108,45 @@ def create_landmarker():
 def normalize_landmarks(coords: np.ndarray) -> np.ndarray:
     """
     Normalize hand landmarks relative to wrist (landmark 0).
-    
-    - Translation: Subtract wrist position (makes wrist origin)
-    - Scale: Divide by wrist-to-middle-MCP distance
+    Scale: Divide by wrist-to-middle-MCP distance (same as main.py).
     """
     wrist = coords[0]
     translated = coords - wrist
-    
     middle_mcp = translated[9]
     scale = np.linalg.norm(middle_mcp)
-    
     if scale < 1e-6:
         scale = 1.0
-    
     return translated / scale
+
+
+def _one_hand_to_63(hand_landmarks, handedness: str) -> np.ndarray:
+    """Single-hand: normalize, mirror if needed (match main.py), return 63-dim."""
+    raw = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks])
+    normalized = normalize_landmarks(raw)
+    if handedness != MODEL_TRAINED_HAND:
+        normalized[:, 0] = -normalized[:, 0]
+    return normalized.flatten().astype(np.float32)
+
+
+def _results_to_126(results) -> Optional[np.ndarray]:
+    """
+    Convert detection results to 126-dim [Left_63, Right_63]. One hand → other half zeros.
+    Order and mirroring must match main.py extract_landmarks_multi_hand.
+    """
+    if not results.hand_landmarks:
+        return None
+    hands: List[Tuple[str, np.ndarray]] = []
+    for i, hand_landmarks in enumerate(results.hand_landmarks):
+        handedness = "Right"
+        if results.handedness and i < len(results.handedness) and results.handedness[i]:
+            handedness = results.handedness[i][0].category_name
+        hands.append((handedness, _one_hand_to_63(hand_landmarks, handedness)))
+    hands.sort(key=lambda x: (0 if x[0] == "Left" else 1, x[0]))
+    if len(hands) == 2:
+        return np.concatenate([hands[0][1], hands[1][1]], axis=0)
+    if len(hands) == 1:
+        return np.concatenate([hands[0][1], np.zeros(FEATURE_SIZE_ONE_HAND, dtype=np.float32)], axis=0)
+    return None
 
 
 def extract_landmarks_from_image(
@@ -124,39 +154,22 @@ def extract_landmarks_from_image(
     image_path: Path
 ) -> Optional[np.ndarray]:
     """
-    Extract normalized landmarks from a single image.
-    
-    Returns:
-        Flattened array of 63 values (21 landmarks × 3 coords) or None if no hand detected
+    Extract landmarks from one image. Returns 126-dim if MULTI_HAND else 63-dim, or None.
     """
-    # Read image
     image = cv2.imread(str(image_path))
     if image is None:
         return None
-    
-    # Convert BGR to RGB
     rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    
-    # Create MediaPipe Image
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
-    
-    # Detect hands
     results = landmarker.detect(mp_image)
-    
+    if MULTI_HAND:
+        return _results_to_126(results)
     if not results.hand_landmarks:
         return None
-    
-    # Get first hand's landmarks
     hand_landmarks = results.hand_landmarks[0]
-    
-    # Extract raw coordinates
     raw_coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks])
-    
-    # Normalize
     normalized = normalize_landmarks(raw_coords)
-    
-    # Flatten to 1D array (63 values)
-    return normalized.flatten()
+    return normalized.flatten().astype(np.float32)
 
 
 def extract_landmarks_from_video(
@@ -165,44 +178,30 @@ def extract_landmarks_from_video(
     sample_rate: int = 2
 ) -> List[np.ndarray]:
     """
-    Extract normalized landmarks from video frames.
-    
-    Args:
-        landmarker: MediaPipe HandLandmarker
-        video_path: Path to video file
-        sample_rate: Extract every Nth frame
-    
-    Returns:
-        List of flattened landmark arrays (one per sampled frame)
+    Extract landmarks from video frames. Each frame → 126-dim if MULTI_HAND else 63-dim.
     """
     cap = cv2.VideoCapture(str(video_path))
-    landmarks_list = []
+    landmarks_list: List[np.ndarray] = []
     frame_num = 0
-    
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-        
         frame_num += 1
-        
-        # Sample every Nth frame
         if frame_num % sample_rate != 0:
             continue
-        
-        # Convert BGR to RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-        
-        # Detect hands
         results = landmarker.detect(mp_image)
-        
-        if results.hand_landmarks:
-            hand_landmarks = results.hand_landmarks[0]
-            raw_coords = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks])
-            normalized = normalize_landmarks(raw_coords)
-            landmarks_list.append(normalized.flatten())
-    
+        if MULTI_HAND:
+            vec = _results_to_126(results)
+            if vec is not None:
+                landmarks_list.append(vec)
+        elif results.hand_landmarks:
+            raw = np.array([[lm.x, lm.y, lm.z] for lm in results.hand_landmarks[0]])
+            normalized = normalize_landmarks(raw)
+            landmarks_list.append(normalized.flatten().astype(np.float32))
     cap.release()
     return landmarks_list
 
@@ -231,7 +230,7 @@ def chunk_into_sequences(frames: List[np.ndarray], sequence_length: int) -> List
     for start in range(0, num_frames - sequence_length + 1, step):
         window = frames[start : start + sequence_length]
         if len(window) == sequence_length:
-            seq = np.stack(window, axis=0).astype(np.float32)  # (sequence_length, 63)
+            seq = np.stack(window, axis=0).astype(np.float32)  # (sequence_length, FEATURE_SIZE)
             sequences.append(seq)
 
     return sequences
@@ -254,7 +253,7 @@ def process_all_gestures() -> Path:
     print("✅ Model loaded\n")
 
     print("=" * 60)
-    print("📊 PROCESSING GESTURES INTO 30-FRAME CLIPS")
+    print(f"📊 PROCESSING GESTURES INTO 30-FRAME CLIPS (shape 30×{FEATURE_SIZE})")
     print("=" * 60)
 
     total_sequences = 0

@@ -35,8 +35,9 @@ SEQUENCE_DIR = DATA_DIR / "sequences_lstm"
 LABELS_PATH = PROJECT_ROOT / "labels.json"
 MODEL_OUTPUT_PATH = PROJECT_ROOT / "lstm_model.keras"
 
-SEQUENCE_LENGTH = 30  # frames
-FEATURE_SIZE = 63     # 21 landmarks × 3 coords
+SEQUENCE_LENGTH = 30  # frames (must match main.py)
+# 126 = two-hand (21×3×2) for WLASL; must match main.py MULTI_HAND and extract_landmarks MULTI_HAND
+FEATURE_SIZE = 126
 
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
@@ -74,7 +75,7 @@ def load_sequence_data() -> Tuple[np.ndarray, np.ndarray, List[str]]:
         data/sequences_lstm/<LABEL>/*.npy
 
     Returns:
-        X: array of shape (num_samples, 30, 63)
+        X: array of shape (num_samples, 30, FEATURE_SIZE) e.g. (N, 30, 126)
         y: array of shape (num_samples,) with integer label indices
         labels: list of label strings (index-aligned with y)
     """
@@ -133,9 +134,7 @@ def load_sequence_data() -> Tuple[np.ndarray, np.ndarray, List[str]]:
 
 def build_lstm_model(num_classes: int) -> tf.keras.Model:
     """
-    Build a simple LSTM-based action recognition model.
-
-    Input shape is fixed to (SEQUENCE_LENGTH, FEATURE_SIZE) = (30, 63).
+    Build LSTM for action recognition. Input shape (SEQUENCE_LENGTH, FEATURE_SIZE) = (30, 126) for two-hand.
     """
     inputs = tf.keras.Input(shape=(SEQUENCE_LENGTH, FEATURE_SIZE), name="landmark_sequence")
 

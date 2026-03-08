@@ -15,10 +15,11 @@ import numpy as np
 import sys
 import io
 import json
+import time
 import urllib.request
 from pathlib import Path
 from collections import deque
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import tensorflow as tf
 
@@ -49,13 +50,17 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 
 # Temporal sequence settings (for LSTM input)
-SEQUENCE_LENGTH = 30      # Number of frames in each sequence
-FEATURE_SIZE = 63         # 21 landmarks × 3 coordinates
+SEQUENCE_LENGTH = 30       # Number of frames in each sequence
+FEATURE_SIZE_ONE_HAND = 63 # 21 landmarks × 3 coordinates
+# Multi-hand: 2 hands → 126 features (WLASL-ready for signs like 'Book').
+# When MULTI_HAND is True, train with train_lstm.py using 126-dim sequences (see train_lstm/extract_landmarks).
+MULTI_HAND = True
+FEATURE_SIZE = 126 if MULTI_HAND else FEATURE_SIZE_ONE_HAND
 
-# Temporal smoothing settings (over model predictions)
-BUFFER_SIZE = 10          # Number of frames to consider
-MIN_AGREEMENT = 7         # Minimum frames with same prediction
-CONFIDENCE_THRESHOLD = 0.70  # Minimum confidence to display gesture
+# Temporal smoothing (lower = less lag, faster UI updates)
+BUFFER_SIZE = 6
+MIN_AGREEMENT = 3
+CONFIDENCE_THRESHOLD = 0.70
 
 # UI settings
 OVERLAY_HEIGHT = 80       # Height of bottom overlay
@@ -82,7 +87,7 @@ def download_mediapipe_model():
 
 
 def load_labels():
-    """Load gesture labels from labels.json."""
+    """Load gesture labels from labels.json (dynamic; add WLASL words without code changes)."""
     if not LABELS_PATH.exists():
         print(f"Error: labels.json not found at {LABELS_PATH}")
         print("Create labels.json (a JSON list of label strings) before running this script.")
@@ -99,7 +104,7 @@ def load_labels():
 
 
 def load_lstm_model():
-    """Load the trained LSTM action recognition model and its label set."""
+    """Load the trained LSTM and label set. Categories come from labels.json only (WLASL-ready)."""
     if not MODEL_PATH.exists():
         print(f"Error: LSTM model not found at {MODEL_PATH}")
         print("Run train_lstm.py first to train the action recognition model.")
@@ -108,7 +113,14 @@ def load_lstm_model():
     labels = load_labels()
     model = tf.keras.models.load_model(MODEL_PATH)
 
-    print(f"Loaded LSTM model with classes: {labels}")
+    # Ensure model expects current feature size (63 one-hand vs 126 two-hand)
+    expected_shape = (None, SEQUENCE_LENGTH, FEATURE_SIZE)
+    if model.input_shape[1:] != (SEQUENCE_LENGTH, FEATURE_SIZE):
+        print(f"Error: Model input shape is {model.input_shape[1:]}, but main.py expects (30, {FEATURE_SIZE}).")
+        print("Retrain with train_lstm.py using the same MULTI_HAND / FEATURE_SIZE setup.")
+        sys.exit(1)
+
+    print(f"Loaded LSTM model; classes from labels.json: {labels}")
     return model, labels
 
 
@@ -120,7 +132,7 @@ def create_hand_landmarker():
     options = vision.HandLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.IMAGE,
-        num_hands=1,
+        num_hands=2,  # Multi-hand for WLASL (e.g. two-hand signs like 'Book')
         min_hand_detection_confidence=0.5,
         min_hand_presence_confidence=0.5,
     )
@@ -206,6 +218,41 @@ def extract_landmarks(hand_landmarks, handedness: str, is_selfie_view: bool = Tr
     
     # Flatten to 1D array (63 values)
     return normalized.flatten()
+
+
+def _one_hand_to_63(hand_landmarks, handedness: str) -> np.ndarray:
+    """Single-hand landmarks: normalize, mirror, return 63-dim."""
+    raw = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks])
+    normalized = normalize_landmarks(raw)
+    if handedness != MODEL_TRAINED_HAND:
+        normalized[:, 0] = -normalized[:, 0]
+    return normalized.flatten().astype(np.float32)
+
+
+def extract_landmarks_multi_hand(results) -> Optional[np.ndarray]:
+    """
+    Extract features for 0, 1, or 2 hands. Always returns 126-dim for WLASL (two-hand signs).
+    Canonical order: [Left_63, Right_63]. One hand: other half zero-padded.
+    """
+    if not results.hand_landmarks:
+        return None
+
+    hands: List[Tuple[str, np.ndarray]] = []
+    for i, hand_landmarks in enumerate(results.hand_landmarks):
+        handedness = "Right"
+        if results.handedness and i < len(results.handedness) and results.handedness[i]:
+            handedness = results.handedness[i][0].category_name
+        vec = _one_hand_to_63(hand_landmarks, handedness)
+        hands.append((handedness, vec))
+
+    # Canonical order: Left first, Right second (for consistent model input)
+    hands.sort(key=lambda x: (0 if x[0] == "Left" else 1, x[0]))
+
+    if len(hands) == 2:
+        return np.concatenate([hands[0][1], hands[1][1]], axis=0)  # (126,)
+    if len(hands) == 1:
+        return np.concatenate([hands[0][1], np.zeros(FEATURE_SIZE_ONE_HAND, dtype=np.float32)], axis=0)  # (126,)
+    return None
 
 
 # ============================================================================
@@ -317,21 +364,15 @@ def draw_hand_landmarks(frame: np.ndarray, hand_landmarks, width: int, height: i
 
 
 def draw_overlay(
-    frame: np.ndarray, 
-    gesture: Optional[str], 
-    confidence: float, 
+    frame: np.ndarray,
+    gesture: Optional[str],
+    confidence: float,
     hand_detected: bool,
-    handedness: Optional[str] = None
+    handedness: Optional[str] = None,
+    fps: Optional[float] = None,
 ):
     """
-    Draw a semi-transparent overlay at the bottom with gesture info.
-    
-    Args:
-        frame: The video frame to draw on
-        gesture: The recognized gesture name (or None)
-        confidence: The prediction confidence (0-1)
-        hand_detected: Whether a hand was detected in the current frame
-        handedness: "Left" or "Right" if hand detected, None otherwise
+    Draw overlay: gesture, confidence, hand indicator, handedness, optional FPS.
     """
     h, w = frame.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -386,10 +427,12 @@ def draw_overlay(
     # Draw "LIVE" indicator
     cv2.putText(frame, "LIVE", (10, 30), font, 0.6, (0, 0, 255), 2)
     cv2.circle(frame, (65, 25), 5, (0, 0, 255), -1)
-    
-    # =========================================================================
-    # DEBUG: Draw handedness info in top-right corner
-    # =========================================================================
+
+    # FPS counter (top-left, below LIVE)
+    if fps is not None:
+        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 58), font, 0.55, (200, 200, 200), 2)
+
+    # Handedness in top-right
     if handedness:
         hand_text = f"Hand: {handedness}"
         # Color code: Green if matches model, Yellow if mirrored
@@ -435,90 +478,89 @@ def main():
     print(f"Resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
     print("\nPress 'Q' to quit")
     print("=" * 50 + "\n")
-    
+
+    # FPS profiling
+    t_prev = time.perf_counter()
+    fps_smooth = 0.0
+
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
                 print("Error: Failed to read frame")
                 break
-            
+
             # Flip frame horizontally (mirror/selfie effect)
             frame = cv2.flip(frame, 1)
             h, w = frame.shape[:2]
-            
+
             # Convert BGR to RGB for MediaPipe
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-            
-            # Detect hands
+
+            # Detect hands (up to 2 for multi-hand / WLASL)
             results = landmarker.detect(mp_image)
-            
+
             hand_detected = bool(results.hand_landmarks)
             current_confidence = 0.0
             detected_handedness = None
-            
+
+            # Draw all detected hands
             if results.hand_landmarks:
-                hand_landmarks = results.hand_landmarks[0]
-                
-                # Get handedness (Left or Right)
-                # MediaPipe reports handedness based on the flipped frame.
-                # We need TWO versions:
-                #   1. mp_handedness: Raw from MediaPipe - used for landmark mirroring (model expects this)
-                #   2. display_handedness: Inverted - shown to user (matches their actual hand)
-                if results.handedness and len(results.handedness) > 0:
-                    mp_handedness = results.handedness[0][0].category_name
+                for hand_landmarks in results.hand_landmarks:
+                    draw_hand_landmarks(frame, hand_landmarks, w, h)
+                # Handedness for UI: "L", "R", or "L+R"
+                if results.handedness and len(results.handedness) >= 1:
+                    names = [results.handedness[i][0].category_name for i in range(len(results.handedness))]
+                    parts = ["L" if n == "Left" else "R" for n in sorted(names, key=lambda x: (0 if x == "Left" else 1))]
+                    detected_handedness = "+".join(parts)
                 else:
-                    mp_handedness = "Right"  # Default assumption
-                
-                # Invert for display only (user sees correct hand label)
-                # In selfie view: MediaPipe "Left" = User's Right hand, and vice versa
-                display_handedness = "Left" if mp_handedness == "Right" else "Right"
-                detected_handedness = display_handedness  # For UI display
-                
-                # Draw hand landmarks
-                draw_hand_landmarks(frame, hand_landmarks, w, h)
-                
-                # Extract and normalize landmarks (with handedness-aware mirroring)
-                # Use RAW MediaPipe handedness for processing (model was trained this way)
-                features = extract_landmarks(
-                    hand_landmarks,
-                    handedness=mp_handedness,  # Use raw MediaPipe handedness for model
-                    is_selfie_view=True,  # Frame is flipped
-                )
+                    detected_handedness = "R"
 
-                if features is not None:
-                    # Add features to temporal sequence buffer
-                    sequence_buffer.append(features.astype(np.float32))
-
-                    # Only run prediction when we have a full 30-frame sequence
-                    if len(sequence_buffer) == SEQUENCE_LENGTH:
-                        sequence_array = np.array(sequence_buffer, dtype=np.float32).reshape(
-                            1, SEQUENCE_LENGTH, FEATURE_SIZE
-                        )
-                        proba = model.predict(sequence_array, verbose=0)[0]
-                        predicted_idx = int(np.argmax(proba))
-
-                        if 0 <= predicted_idx < len(labels):
-                            predicted_gesture = labels[predicted_idx]
-                        else:
-                            predicted_gesture = str(predicted_idx)
-
-                        current_confidence = float(proba[predicted_idx])
-
-                        # Add to buffer for temporal smoothing over predictions
-                        prediction_buffer.add_prediction(predicted_gesture, current_confidence)
+            # Feature extraction: multi-hand (126-dim) or single-hand (63-dim)
+            if MULTI_HAND:
+                features = extract_landmarks_multi_hand(results)
             else:
-                # No hand detected; reset temporal sequence buffer
+                features = None
+                if results.hand_landmarks and results.handedness and len(results.handedness) > 0:
+                    mp_handedness = results.handedness[0][0].category_name
+                    features = extract_landmarks(
+                        results.hand_landmarks[0],
+                        handedness=mp_handedness,
+                        is_selfie_view=True,
+                    )
+
+            if features is not None:
+                sequence_buffer.append(features.astype(np.float32))
+
+                # Sliding-window inference (step=1): predict every frame once buffer is full
+                if len(sequence_buffer) == SEQUENCE_LENGTH:
+                    sequence_array = np.array(sequence_buffer, dtype=np.float32).reshape(
+                        1, SEQUENCE_LENGTH, FEATURE_SIZE
+                    )
+                    proba = model.predict(sequence_array, verbose=0)[0]
+                    predicted_idx = int(np.argmax(proba))
+
+                    if 0 <= predicted_idx < len(labels):
+                        predicted_gesture = labels[predicted_idx]
+                    else:
+                        predicted_gesture = str(predicted_idx)
+
+                    current_confidence = float(proba[predicted_idx])
+                    prediction_buffer.add_prediction(predicted_gesture, current_confidence)
+            else:
                 sequence_buffer.clear()
-            
-            # Get stable prediction from buffer
+
+            # FPS (exponential moving average)
+            t_now = time.perf_counter()
+            dt = t_now - t_prev
+            t_prev = t_now
+            if dt > 0:
+                fps_smooth = 0.9 * fps_smooth + 0.1 * (1.0 / dt)
+
             stable_gesture, stable_confidence = prediction_buffer.get_stable_prediction()
-            
-            # Draw UI overlay (with handedness debug info)
-            draw_overlay(frame, stable_gesture, stable_confidence, hand_detected, detected_handedness)
-            
-            # Display frame
+            draw_overlay(frame, stable_gesture, stable_confidence, hand_detected, detected_handedness, fps=fps_smooth)
+
             cv2.imshow("SignLens - ASL Recognition", frame)
             
             # Check for quit
