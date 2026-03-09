@@ -44,13 +44,17 @@ youtube_video.*
 *.mkv
 *.avi
 
-# Model files (future)
+# Model files
 *.h5
 *.pkl
+*.keras
 *.joblib
 *.onnx
 *.task
 saved_models/
+
+# WLASL source (cloned repo; regenerate with git clone)
+wlasl_source/
 
 # Data files (large datasets - not tracked)
 data/
