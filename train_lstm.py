@@ -31,7 +31,8 @@ if sys.platform == "win32":
 
 PROJECT_ROOT = Path(__file__).parent
 DATA_DIR = PROJECT_ROOT / "data"
-SEQUENCE_DIR = DATA_DIR / "sequences_lstm"
+# Use sequences_multi_hand for WLASL (flat gloss_videoid.npy); or sequences_lstm (nested gloss/*.npy)
+SEQUENCE_DIR = DATA_DIR / "sequences_multi_hand"
 LABELS_PATH = PROJECT_ROOT / "labels.json"
 MODEL_OUTPUT_PATH = PROJECT_ROOT / "lstm_model.keras"
 
@@ -69,17 +70,13 @@ def load_labels() -> List[str]:
 
 def load_sequence_data() -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
-    Load 30-frame landmark sequences from SEQUENCE_DIR.
-
-    Directory layout is expected to be:
-        data/sequences_lstm/<LABEL>/*.npy
-
-    Returns:
-        X: array of shape (num_samples, 30, FEATURE_SIZE) e.g. (N, 30, 126)
-        y: array of shape (num_samples,) with integer label indices
-        labels: list of label strings (index-aligned with y)
+    Load 30-frame sequences from SEQUENCE_DIR.
+    Supports:
+      - Nested: sequences_lstm/<LABEL>/*.npy
+      - Flat:    sequences_multi_hand/<gloss>_<videoid>.npy (label from prefix)
     """
     labels = load_labels()
+    label_to_idx = {lb: i for i, lb in enumerate(labels)}
 
     if not SEQUENCE_DIR.exists():
         print(f"\n❌ Error: sequence directory not found at {SEQUENCE_DIR}")
@@ -93,27 +90,39 @@ def load_sequence_data() -> Tuple[np.ndarray, np.ndarray, List[str]]:
     print("📂 LOADING SEQUENCE DATA")
     print("=" * 60)
 
-    for label_idx, label in enumerate(labels):
-        gesture_dir = SEQUENCE_DIR / label
-        if not gesture_dir.exists():
-            print(f"⚠️  No sequences found for label '{label}' at {gesture_dir}")
-            continue
-
-        npy_files = sorted(gesture_dir.glob("*.npy"))
-        if not npy_files:
-            print(f"⚠️  No .npy files for label '{label}'")
-            continue
-
-        for npy_path in npy_files:
+    # Flat layout: gloss_videoid.npy
+    flat_npy = sorted(SEQUENCE_DIR.glob("*.npy"))
+    if flat_npy:
+        per_label: dict = {}
+        for npy_path in flat_npy:
+            stem = npy_path.stem
+            parts = stem.rsplit("_", 1)
+            gloss = parts[0] if len(parts) == 2 else stem
+            if gloss not in label_to_idx:
+                continue
             seq = np.load(npy_path)
             if seq.shape != (SEQUENCE_LENGTH, FEATURE_SIZE):
-                print(f"   ⚠️ Skipping {npy_path.name} with unexpected shape {seq.shape}")
                 continue
-
             X_list.append(seq.astype(np.float32))
-            y_list.append(label_idx)
-
-        print(f"   ✅ Loaded {len(npy_files)} sequences for '{label}'")
+            y_list.append(label_to_idx[gloss])
+            per_label[gloss] = per_label.get(gloss, 0) + 1
+        for lb in labels:
+            print(f"   ✅ Loaded {per_label.get(lb, 0)} sequences for '{lb}'")
+    else:
+        # Nested layout
+        for label_idx, label in enumerate(labels):
+            gesture_dir = SEQUENCE_DIR / label
+            if not gesture_dir.exists():
+                continue
+            npy_files = sorted(gesture_dir.glob("*.npy"))
+            for npy_path in npy_files:
+                seq = np.load(npy_path)
+                if seq.shape != (SEQUENCE_LENGTH, FEATURE_SIZE):
+                    continue
+                X_list.append(seq.astype(np.float32))
+                y_list.append(label_idx)
+            if npy_files:
+                print(f"   ✅ Loaded {len(npy_files)} sequences for '{label}'")
 
     if not X_list:
         print("\n❌ Error: No valid sequences found.")
