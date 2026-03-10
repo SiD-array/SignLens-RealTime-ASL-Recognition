@@ -509,13 +509,19 @@ def main():
             if results.hand_landmarks:
                 for hand_landmarks in results.hand_landmarks:
                     draw_hand_landmarks(frame, hand_landmarks, w, h)
-                # Handedness for UI: "L", "R", or "L+R"
+                # Handedness for UI: show SCREEN left/right, not anatomical.
+                # In selfie view, anatomical Left appears on the RIGHT side of the screen.
+                # So we invert labels for display only:
+                #   anatomical Left  -> "R" on screen
+                #   anatomical Right -> "L" on screen
                 if results.handedness and len(results.handedness) >= 1:
                     names = [results.handedness[i][0].category_name for i in range(len(results.handedness))]
-                    parts = ["L" if n == "Left" else "R" for n in sorted(names, key=lambda x: (0 if x == "Left" else 1))]
-                    detected_handedness = "+".join(parts)
+                    # Sort by anatomical Left/Right for stable ordering, then map to screen labels
+                    sorted_names = sorted(names, key=lambda x: (0 if x == "Left" else 1))
+                    screen_parts = ["R" if n == "Left" else "L" for n in sorted_names]
+                    detected_handedness = "+".join(screen_parts)
                 else:
-                    detected_handedness = "R"
+                    detected_handedness = "?"
 
             # Feature extraction: multi-hand (126-dim) or single-hand (63-dim)
             if MULTI_HAND:
